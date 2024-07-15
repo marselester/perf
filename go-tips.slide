@@ -1,0 +1,660 @@
+Go performance tips
+
+15 July 2024
+
+Marsel Mavletkulov
+@marselester
+
+: Hi everyone, today's presentation is a collection of Go performance tips I managed to forage.
+
+* 🦉 Under the hood
+
+* CPU basic operations
+
+: Let's start with a quick overview of what makes programs run.
+: A program consists of machine instructions which are executed by CPU.
+
+The CPU executes machine instructions that it retrieves from memory
+
+Inside the CPU, there is a storage device called the register file which contains 16 word-sized registers (typically 64 bits)
+
+: ---
+: Footnote: Under the hood the register file has more _physical_ registers to which those 16 _logical_ registers are aliased. Having more physical registers helps to resolve data hazards, e.g., using register renaming technique.
+
+In general, the CPU performs the following operations as per instruction:
+
+- *load* copies a byte/word from memory into register
+- *store* copies a byte/word from register into memory
+- *operate* copies the contents of two registers to the arithmetic logic unit, performs an arithmetic operation, and stores the result in a register
+- *jump* copies a word from the instruction into the program counter
+
+* CPU basic workflow
+
+: What is the program counter? It is a register that contains the memory address of a machine instruction to execute.
+
+Simplified process of how the CPU executes instructions:
+
+- reads the machine instruction from memory pointed at by the program counter (*rip* register), e.g., `rip=0x116a`
+- executes the machine instruction, `pop`%rbx`
+- updates *rip* register to point to the next instruction, `rip=0x116b`
+
+    register | value (8 bytes)         memory address | value (1 byte)
+    rip      | 0x116a           ➔ ➔ ➔  0x116a         | 0x5b # pop %rbx
+                                       0x116b         | 0x5d # pop %rbp
+                                       0x116c         | 0xc3 # ret
+
+* Instruction pipelining
+
+: Even though it appears that only one instruction is executed at a time.
+
+The CPU executes more instructions by dividing their processing into parallel stages such as:
+
+- fetching the instruction from memory
+- determining the instruction type
+- reading from memory
+- performing an arithmetic operation
+- writing to memory
+
+Most instructions in a program can be pipelined and executed in parallel since they are independent
+
+* Out-of-order execution
+
+The CPU can perform out-of-order execution of the pipeline, where later instructions can be completed while earlier instructions are stalled, improving instruction throughput
+
+An instruction is called *retired* when it's executed and its results are visible in the architecture state
+
+The CPU must retire all instructions in the program order to ensure its correctness
+
+* Speculative execution
+
+: Another feature that makes the CPU fast is speculative execution.
+
+The CPU takes a guess on an outcome of the branch condition and proceeds executing machine instructions without waiting for the actual outcome to keep the pipeline full
+
+A branch instruction can be dependent on a value loaded from memory which is slow, but the CPU keeps working on next instructions
+
+    balance := w.Balance()
+    if balance < limit {    // CPU predicted that the balance is less than the limit,
+        w.Withdraw(balance) // so Withdraw() instructions were executed speculatively.
+    } else {
+        w.WaitForPayday()
+    }
+
+If the guess was right, there is a performance gain, otherwise it's a wasted effort and ~15 cycles penalty
+
+: ---
+: Footnote: The CPU tracks progress of speculation in the reorder buffer and retires instructions in the program order.
+
+* CPU clock cycle ⏰
+
+: What is the CPU clock cycle?
+
+The CPU clock cycle is the time required to move a machine instruction
+from one pipeline stage to the other
+
+For instance, 1GHz CPU implies that its clock runs at one billion cycles per second (10^9), therefore the time required for each clock cycle is 1 nanosecond
+
+Is 15 cycles penalty a lot? It's equivalent to ~4 reads from L1 cache
+
+: ---
+: Footnote: CPU's clock is an oscillator crystal that generates pulses at certain frequency. Faster the clock — more instructions CPU can execute per second.
+
+* Cache hierarchy
+
+: Since we've mentioned the CPU cache, let's see how many CPU cycles it takes to access various storages. The data stored in a register requires 0 CPU cycles to access.
+
+- CPU L1-L3 caches cache 64-byte blocks (cache lines) of the main memory
+- Memory caches 4 KB pages of virtual memory and parts of files (buffer cache)
+- Disk controller caches 4 KB disk sectors
+
+: Each CPU core has its own level 1 and 2 caches. L1 is split into d-cache to read/write data and i-cache to read recently fetched machine instructions. All cores share level 3 cache and the interface to the main memory.
+: ---
+: Footnote: Whenever we request a byte from the main memory, we are also fetching its cache line neighbours.
+: Buses transfer word-sized information between CPU, main memory, disk, etc.
+
+    Registers                  Registers                     (0 cycles)
+        |                          |
+    L1 d-cache  L1 i-cache ... L1 d-cache  L1 i-cache        (~4 cycles)
+              \/                         \/
+            L2 cache                  L2 cache               (~10 cycles)
+                    \                /
+                     \-- L3 cache --/                        (~50 cycles)
+                            |
+                        Bus interface
+                            |
+                            | System bus
+                            |
+                        I/O bridge --------- Disk controller (~100K cycles)
+                            |       I/O bus      |
+                 Memory bus |                   Disk         (~10M cycles)
+                            |
+                        Main memory                          (~200 cycles)
+
+* Physical memory caches virtual memory
+
+: What does it mean to cache the virtual memory in the physical memory?
+
+A process provides a program an illusion that it has exclusive use of the whole memory address space `[0..256TB]` using *virtual*memory* abstraction
+
+: It is crucial to mention, that a process has an impression that it has more memory than it is physically available on our computers.
+: ---
+: Footnote: 48th power of 2 is 256 TB and it exceeds physical memory size we normally have.
+
+Physical memory is organized as an array of bytes and it's partitioned into 4 KB blocks called page frames
+
+: A page frame size depends on the CPU architecture.
+
+A virtual page can be mapped to a page frame as follows:
+
+- *cached* — 4 KB of data is already loaded to physical memory from disk (backed by a page frame)
+- *uncached* — doesn't occupy physical memory yet, but is already associated with the 4 KB part of a file on disk
+- *unallocated* — doesn't point to physical memory or to disk
+
+This mapping is stored in the kernel data structure called *page*table*
+
+* Virtual to physical address translation
+
+The CPU relies on the *memory*management*unit* (MMU) to translate
+virtual memory addresses to physical ones
+
+The MMU uses:
+
+- the page tables to translate addresses
+- the *translation*lookaside*buffer* (TLB) as its cache (0 cycles access time)
+
+: ---
+: Illustration: here we can see an address translation depicted as a running athlete when there is a TLB hit.
+: On the TLB miss (person walking) the translation takes longer because the MMU has to search in the page tables (in the main memory).
+: The worst case scenario is loading a virtual page from the disk at a snail pace.
+
+    virtual address  🏃🏽‍♂️‍➡️    -----  🚶🏽‍♂️‍➡️ 🚶🏽‍♂️‍➡️ 🚶🏽‍♂️‍➡️  -------------           --------------
+                       🏃🏽‍♂️‍➡️ | TLB |         | page tables | 🐌 🐌 🐌 | page on disk |
+                       🏃🏾‍♀️  -----  🚶🏾‍♀️ 🚶🏾‍♀️ 🚶🏾‍♀️  -------------           --------------
+    physical address 🏃🏾‍♀️
+
+* Page faults 🐌
+
+: Let's have a closer look at the worst case scenario.
+
+The 4 KB piece of file will be loaded from disk to memory when a referenced virtual memory address happens to be part of an *uncached*virtual*page*
+
+The MMU signals the page fault exception when it can't find the address mapping in the page tables:
+
+- OS's exception handler sets up a transfer from disk to memory (thousands of cycles)
+- OS schedules a different process on the CPU
+- OS returns to the original process to retry the instruction that caused the page fault (millions of cycles later)
+
+: Linux can associate a virtual memory area with a contiguous section of a file, e.g., executable object file. That section (e.g., code segment) is divided into page-size chunks. When the CPU accesses a virtual address that is within some page's region, that virtual page (e.g., some content of an executable file) is loaded to the physical memory from disk.
+
+: ---
+: Footnote: Direct memory access (DMA) technique allows data to travel directly from disk to memory avoiding the CPU.
+
+* 🔬 Microarchitecture analysis
+
+: Having all this in mind, how can we find why CPU is stalling when executing our program?
+
+* Cycles per instruction retired
+
+: Let's start with the metric called "cycles per instruction retired". It indicates how many cycles it took to retire one instruction on average.
+: An instruction is called _retired_ when it's executed and its results are visible in the architecture state.
+
+Intel VTune defines CPI (cycles per instruction retired) as a metric indicating how much time each executed instruction took, in units of cycles:
+
+- the CPU issues up to 4 instructions per cycle, suggesting a best CPI of 0.25
+- a CPI > 1 indicates that the CPU is often stalled, typically for memory access
+
+Other reasons for elevated CPI metric:
+
+- non-retired instructions due to branch mispredictions
+- instruction starvation in the CPU frontend where instructions are fetched and decoded
+- floating-point or SIMD operations
+
+* High CPI example: memory bound code change
+
+Once we've got ~20% decrease in CPU usage by swapping to a stateless compression in Parca Agent, but I've misused it a bit and caused `flate.StatelessDeflate` to show up in a VTune profile with *124.4*CPI*, see [[https://github.com/klauspost/compress/discussions/717][#717]]
+
+The author of `compress` package advised to use a pool of gzip writers to get 2x-3x speed up, that also solved high CPI issue caused by a memory access, see [[https://github.com/parca-dev/parca-agent/pull/1161][#1161]]
+
+.image img/vtune-memory-bound.png 550 _
+
+* VTune metrics
+
+In an ideal world, we would fully saturate the CPU and see *retiring* metric at 100%
+
+Realistically we would observe non-zero percentages of the following metric categories:
+
+- front-end bound: the CPU backend waits for instructions to execute, but the frontend can't fetch them from the caches/memory
+- back-end bound (memory bound, core bound): the CPU backend waits for memory accesses, the divider unit overload
+- bad speculation: regular branch mispredictions
+
+*Front-end*bound* metric at ~20% or *bad*speculation* higher than 10% need attention
+
+: ---
+: Footnote: Memory bound bucket is further split into L1-3 bound, DRAM bound, Store bound.
+
+* VTune reports inefficiencies in CPU usage
+
+: Here is how the VTune report looked like from the "stateless compression" misuse.
+: ---
+: Footnote: UOP is a micro operation such as load or store from/to memory.
+: A pipeline slot represents hardware resources needed to process one UOP.
+: The metrics are expressed as a percentage of unutilized pipeline slots.
+
+.image img/vtune-tma.png 550 _
+
+* Frontend optimizations
+
+: What can be done to address frontend inefficiencies?
+
+Machine code layout in a program affects CPU instruction cache utilization: filling cache lines with rarely executed "cold" code will take up limited space
+
+Isolate cold code to their own functions and disable inlining
+
+    //go:noinline
+    func rarelyCalledFunc() { ... }
+
+Group hot functions together so they can occupy the same cache line
+
+: ---
+: Footnote: Less cache lines for the CPU to fetch, less cache lines fragmentation.
+
+    func oftenCalledFunc1() { ... }
+    func oftenCalledFunc2() { ... }
+
+Go supports [[https://go.dev/doc/pgo][profile-guided optimization]] that optimizes code layout for us
+
+    $ go build -pgo cpu.pprof ./cmd/server/
+
+Building with PGO improves performance by around 2-14%
+
+: PGO takes care of those code layout optimizations: func inlining, block reorder to maintain fall through hot code in "if" blocks, puts hot vars into registers.
+
+* Backend optimizations: memory bound
+
+: Most of us would probably find CPU backend inefficiencies in own code.
+
+Cache misses hurt program's performance, so the goal is to deliver right data
+to the CPU in time:
+
+- use a value as often as possible once it has been read from memory, so it will be read from L1 cache next time (*temporal*locality*)
+- access data structures (arrays, structs) sequentially in the order they are stored in memory, so multiple values are read from the same cache line (*spatial*locality*)
+
+Data is prefetched (read ahead) by the hardware prefetcher when sequential memory access pattern is observed
+
+* Eytzinger binary search
+
+: A good example of inefficient cache usage is classic binary search because its memory access pattern is neither temporally nor spatially local.
+
+Classic binary search accesses array elements in different memory locations (huge memory jumps) and suffers from:
+
+- inefficient cache usage because hot and cold array elements are mixed together
+- branch mispredictions which incur ~15 cycles to flush and fill the CPU pipeline
+
+Eytzinger layout is cache-friendly because hot elements are grouped together in the same cache line, see:
+
+- [[https://algorithmica.org/en/eytzinger]]
+- [[https://en.algorithmica.org/hpc/data-structures/binary-search/]]
+
+This layout is also used for pointer-free implementations of binary trees
+
+* Array of values or array of pointers?
+
+: What is better, array of values or array of pointers? It depends...
+
+Array of values (data is stored contiguously):
+
+- cache-friendly
+- faster linear scan
+
+Array of pointers (data is scattered in memory over time):
+
+- it is flexible `[10]interface{}`
+- takes less memory, e.g., the same pointer appears several times
+
+See also [[https://gameprogrammingpatterns.com/data-locality.html]]
+
+* Pointer chasing 😵‍💫
+
+Robert Nystrom's illustration of the heap becoming increasingly randomly organized over time: traversing those pointers in a tight loop is thrashing the CPU cache
+
+.image img/data-locality-pointer-chasing.png
+
+* Packing structs
+
+: Since the CPU cache is way smaller than memory, packing a cache line with useful data should pay off.
+
+Save the cache line space by:
+
+- using [[https://immunant.com/blog/2020/01/bitfields/][bitfields]]
+- using [[https://craftinginterpreters.com/types-of-values.html#tagged-unions][unions]]
+- avoiding compiler padding in structs
+
+: ---
+: Footnote: Padding is added for efficient access of struct fields.
+
+These Go tools detect structs that would use less memory if their fields were sorted:
+
+- [[https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/fieldalignment][fieldalignment]]
+- [[https://github.com/dkorunic/betteralign][betteralign]]
+
+* False sharing
+
+Sometimes struct padding has to be added manually to avoid false sharing: a situation when two CPU cores read from and write to different struct fields that happen to share the same cache line
+
+    type Foo struct {
+        A int // Read by core 0.
+        B int // Written by core 1.
+    }
+
+: ---
+: Footnote: When write happens in one core, the cache controller invalidates that cache line in other cores, so they have to reload non-stale data to do their reads.
+The solution is to add 64-byte padding so the fields end up in different cache lines
+
+    type Foo struct {
+        A int
+        _ [64]byte // Padding to avoid false sharing.
+        B int
+    }
+
+Check out a case study [[https://netflixtechblog.com/seeing-through-hardware-counters-a-journey-to-threefold-performance-increase-2721924a2822][Seeing through hardware counters]]
+
+* Backend optimizations: core bound
+
+: Moving on to the core bound metric.
+
+The aim is to reduce the amount of heavy instructions and to execute less instructions overall, for example:
+
+- `int64` is twice slower than `uint32` when dealing with modulo operation (the remainder)
+- division and modulo are 30-50 times slower than addition and subtraction: with bit masking we can calculate it faster `a&(b-1)` if `b` is power of two
+- some computations or memory accesses don't need to be in the loop
+
+    for i := 0; i < n; i++ {                for i := 0; i < n; i++ {
+        for j := 0; j < n; j++ {                tmp := c[i]
+            a[j] = b[j] * c[i]                  for j := 0; j < n; j++ {
+        }                                           a[j] = b[j] * tmp
+    }                                           }
+                                            }
+
+Keeping *tmp* value in a register instead of loading it from the cache line at each iteration
+
+* Loop unrolling
+
+: The CPU can't execute multiple instructions in parallel (instruction pipelining) when the input of one instruction depends on the output of another.
+: ---
+: Example: A new iteration can't start until the previous is finished because we read and write from _sum_ variable.
+
+When the input of one instruction depends on the output of another, the CPU has to wait for dependent load/store operations that form a critical path
+
+    for i := 0; i < len(a); i++ {
+        sum += a[i] * b[i]
+    }
+
+We can reduce the data dependencies in the loop by performing more computations per iteration
+
+    for i := 0; i < len(a); i += 4 {
+        s0 := a[i] * b[i]
+        s1 := a[i+1] * b[i+1]
+        s2 := a[i+2] * b[i+2]
+        s3 := a[i+3] * b[i+3]
+        sum += s0 + s1 + s2 + s3
+    }
+
+Loop unrolling has increased the throughput by 37%, see [[https://sourcegraph.com/blog/slow-to-simd][From slow to SIMD]]
+
+* Loop tiling
+
+: Here is another loop optimization which is called loop tiling. The idea is to ...
+
+Keeping data in the CPU cache by traversing the matrix in 8x8 blocks instead of traversing it linearly
+
+    for ib := 0; ib < n; ib += 8 {
+        for jb := 0; jb < n; jb += 8 {
+            for i := ib; i < ib+8; i++ {
+                for j := jb; j < jb+8; j++ {
+                    a[i][j] += b[j][i]
+                }
+            }
+        }
+    }
+
+: ---
+: Footnote: Less efficient version:
+:    for i := 0; i < n; i++ {
+:        for j := 0; j < n; j++ {
+:            a[i][j] += b[j][i]
+:        }
+:    }
+
+* Bad speculation optimizations
+
+: Finally, let's see what can be done with the bad speculation.
+: In general, modern CPUs are good at detecting dynamic patterns and predicting branches. Nevertheless, developers can still help.
+
+The goal is to eliminate the branches to reduce branch mispredictions:
+
+- replace many *if* statements that test a value with a single lookup in a small array
+- eliminate branching with [[https://en.algorithmica.org/hpc/pipelining/branchless/][predication]] at a cost of evaluating both branches and *cmov* instruction (see cmov vs jumps example [[https://github.com/golang/go/issues/27780][#27780]])
+
+* 🌋 Heap allocations
+
+: We have looked at how programs are executed and where CPU could stall.
+: In this final section I would like to talk about memory allocations considering their impact on performance of our programs.
+: Allocations in a frequently called function could cause GC pressure which in turn could cause latency spikes in HTTP requests.
+
+* Collecting Go profiles
+
+: Before we can improve performance, we should profile a program. For instance, we can collect a heap allocations profile.
+: I can think of several ways of obtaining those profiles: running a program till completion, continuous profiling, writing benchmarks.
+
+Ad hoc
+
+    import "github.com/pkg/profile"
+
+    func main() {
+        defer profile.Start(profile.MemProfileAllocs).Stop()
+    }
+
+Via */debug/pprof/** HTTP endpoints (we can leverage [[https://marselester.com/continuous-profiling-in-go.html][continuous profilers]])
+
+    import _ "net/http/pprof"
+
+[[https://pkg.go.dev/testing#hdr-Benchmarks][Write benchmarks]] and run them *go*test*-bench=.*-memprofile=old.pprof*
+
+    func BenchmarkMyFunc(b *testing.B) {
+        b.ResetTimer() // Reset the timer and allocation counters in case of expensive setup.
+        for i := 0; i < b.N; i++ {
+            myFunc()
+        }
+    }
+
+* Interpreting Go profiles
+
+: Once we've collected a heap allocations profile, we need to make sense of it.
+
+Go's [[https://go.dev/blog/pprof][pprof]] profiling tool helps to identify bottlenecks
+
+    $ go tool pprof old.pprof
+    (pprof) top
+    (pprof) list myFunc
+
+: ---
+: Footnote: The "top -cum" command shows top functions by allocations in that function or a function it called down the stack:
+: - "flat" refers to a memory allocated by that function and is held by it,
+: - "cum" refers to a memory allocated by that function or a function it called down the stack.
+: When "flat" and "cum" numbers match, this might indicate the allocated memory is retained.
+
+- show top samples with *top* or *top*-cum* (for cumulative)
+- inspect annotated source of `myFunc` function with *list*myFunc* or *weblist*myFunc*
+- see who called `myFunc` with *peek*myFunc* and *tree*myFunc* (call graph)
+- visualize call graph with *web* (set *call_tree=1* to separate call trees based on context)
+
+: The "web" command opens an allocation graph of function calls.
+
+Interactive web interface
+
+    $ go tool pprof -http=:8000 old.pprof
+    Serving web UI on http://localhost:8000
+
+* Comparing Go profiles
+
+: After bottlenecks were identified and code was optimized, we should quantify the improvements.
+
+The pprof tool is useful to compare profiles before and after making optimizations (see [[https://go.dev/blog/pgo][differential profiling]])
+
+    $ go tool pprof -diff_base old.pprof new.pprof
+    (pprof) top -cum
+
+- old and new profiles should represent the same amount of work
+- the negative values indicate improvements
+
+Go's [[https://pkg.go.dev/golang.org/x/perf/cmd/benchstat][benchstat]] tool compares benchmark results
+
+    $ benchstat old.txt new.txt
+    name       old time/op    new time/op    delta
+    myFunc-12    28.8ms ± 2%    19.6ms ± 1%  -31.87%  (p=0.000 n=10+10)
+
+    name       old alloc/op   new alloc/op   delta
+    myFunc-12    25.9MB ± 0%     8.1MB ± 0%  -68.70%  (p=0.000 n=9+9)
+
+    name       old allocs/op  new allocs/op  delta
+    myFunc-12      108k ± 0%        0k ± 0%  -99.99%  (p=0.000 n=10+10)
+
+: Here we can see the optimizations got rid of ~108 thousand of heap allocations per operation, ~17 MB of alloc/op, and ~9 ms of running time/op.
+
+* Go escape analysis
+
+: In order to reduce heap allocations, it's good to know which variables escape to the heap.
+
+If we're suspecting that a variable escapes to the heap, we can verify that
+with *-gcflags="-m"* flag when building a Go program
+
+Look for "escapes to heap" hints next to a variable in question
+
+    ./something_test.go:192:23: MyVar escapes to heap
+
+We can even do that in benchmarks
+
+    $ go test -gcflags="-m" -run=^$ -bench=^BenchmarkMyFunc$ . 2>&1 | grep 'escapes to heap'
+
+* Usual suspects
+
+Oftentimes one of these is responsible for excessive heap allocations:
+
+- functions returning pointers, e.g., `func`New()`*Book`
+- functions returning `[]byte`
+- `interface{}`
+- creating a new `[]byte` on each function call
+- string manipulations
+
+Some of the problems can be solved by reworking APIs:
+
+- return a value instead of a pointer, e.g., `func`New()`Book`
+- see if we can use [[https://words.filippo.io/efficient-go-apis-with-the-inliner/][mid-stack inliner]]
+- maybe a caller can supply a byte slice so the function doesn't have to allocate it, `PrepareReport(b`[]byte)`
+
+* Object pool
+
+Instead of allocating `*bytes.Buffer` or `[]byte` on every call, we should reuse them to relieve pressure on the GC:
+
+- [[https://pkg.go.dev/sync#Pool]] performs better than *zeropool* if we need to store pointers
+- [[https://github.com/colega/zeropool]] performs better than *sync.Pool* if we need to store values, e.g., it helped to reduce CPU consuption in Prometheus by 20%, see [[https://github.com/prometheus/prometheus/pull/12189][#12189]]
+
+    sp := sync.Pool{New: func() interface{} {
+        return &bytes.Buffer{}
+    }}
+
+    zp := zeropool.New(func() []byte {
+        return nil
+    })
+
+* String manipulations
+
+[[https://pkg.go.dev/strings#Builder]] should be used to efficiently build a string instead of using lots of *+* operators
+
+Sometimes we need to create a lot of small strings, e.g., when decoding a byte stream
+
+Lots of *string(b[n:k])* would result in many allocations, but we can do this instead:
+
+- accumulate bytes in a large-enough buffer
+- create strings with *unsafe.String* using bytes from that buffer
+- once a buffer is filled, create a new one with the same capacity
+- old buffers will be eventually GC-ed with no side effects to the returned strings
+
+For example, ten "fizz" strings written to 40-byte buffer will result in a single allocation instead of ten
+
+* Strings conversion with less allocations
+
+This idea applied to Parca Agent helped to reduce allocs/op from ~33,000 to 30,
+and CPU consumption by 40%, see [[https://github.com/parca-dev/parca-agent/pull/1426][#1426]]
+
+    type stringConverter struct {
+        // buf is a temporary 4 KB buffer where decoded strings are batched.
+        buf []byte
+        // offset is a buffer position where the last string was written.
+        offset int
+    }
+
+    func (c *stringConverter) String(b []byte) string {
+        // Checks and a buffer rotation were omitted for brevity.
+
+        n := len(b)
+        c.buf = append(c.buf, b...)
+
+        b = c.buf[c.offset:]
+        s := unsafe.String(&b[0], n) // Save an allocation 🎉
+        c.offset += n
+
+        return s
+    }
+
+* String interning
+
+: Another approach to reduce allocations and save memory is called string interning.
+
+String interning reduces memory consumption by storing only one copy of a string:
+
+- `map[string]string` (can intern `[]byte`, but it could grow forever)
+- [[https://github.com/go4org/intern]] (GC reclaims strings, but it doesn't support `[]byte` [[https://github.com/go4org/intern/issues/18][#18]])
+- [[https://pkg.go.dev/unique]] (see its [[https://github.com/golang/go/issues/62483][proposal]])
+
+With this Prometheus expression we should see a drop of Go memory usage because strings will be deduplicated
+
+    go_memstats_sys_bytes - go_memstats_heap_released_bytes
+
+Check out [[https://www.datadoghq.com/blog/go-memory-metrics][Go memory metrics demystified]] for more details
+
+: ---
+: Footnote: /memory/classes/total:bytes − /memory/classes/heap/released:bytes
+
+* String interning example
+
+String interning helped to reduce 6 GB memory footprint to under 3.5 GB in one of the services at MaxMind
+
+    type Strings map[string]string
+
+    func (ss Strings) InternBytes(b []byte) string {
+        if original, isInterned := ss[string(b)]; isInterned { // No allocations here 🎉
+            return original
+        }
+
+        s := string(b)
+        ss[s] = s
+
+        return s
+    }
+
+One can also use _sql.RawBytes_ when interning strings queried from a database
+
+* Takeaways
+
+- keep spatial (prefetch) and temporal (reuse) localities in mind to deliver right data to the CPU in time
+- keep heap allocations in check (be mindful how much garbage is generated)
+- help compiler generate optimized code [[https://go.dev/wiki/CompilerOptimizations]]
+
+* References
+
+- Algorithms for Modern Hardware, Sergey Slotin
+- Computer Systems, Randal E. Bryant, David R. O'Hallaron
+- Crafting Interpreters, Robert Nystrom
+- Game Programming Patterns, Robert Nystrom
+- Performance Analysis and Tuning on Modern CPUs, Denis Bakhvalov
