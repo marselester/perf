@@ -3,6 +3,7 @@
 Slides:
 
 - [Go performance tips](https://go-talks.appspot.com/github.com/marselester/perf/go-tips.slide)
+- [Intro to SIMD in Go](https://go-talks.appspot.com/github.com/marselester/perf/go-simd.slide)
 
 Use `present` tool to view the slides:
 

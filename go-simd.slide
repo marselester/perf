@@ -1,0 +1,270 @@
+Intro to SIMD in Go
+
+11 May 2026
+
+Marsel Mavletkulov
+@marselester
+
+: Hi everyone, today we're going to talk about how to get started with SIMD in Go.
+
+* SIMD vs SISD
+
+SIMD stands for Single Instruction Multiple Data
+
+It is a technique to process more data in a single CPU instruction, e.g., we can add these two vectors in 1 CPU cycle
+
+    ADD [4, 3, 2, 1], [8, 7, 6, 5]
+
+It would take 4 instructions to achieve the same result in a scalar mode
+(Single Instruction Single Data or SISD)
+
+    ADD 4, 8
+    ADD 3, 7
+    ADD 2, 6
+    ADD 1, 5
+
+Adding four pairs of integers per CPU cycle makes a program run faster 🏃🏽‍♂️‍➡️ compared to just one pair per cycle 🚶🏽‍♂️‍➡️
+
+* SISD in Go
+
+The easiest way to add up the numbers in a scalar mode is to sum one integer at a time in the loop
+
+.code example/simd-sum/sum/scalar.go
+
+.code example/simd-sum/main.go
+
+* SIMD in Go
+
+: What about SIMD in Go?
+
+As of now Go doesn't support SIMD intrinsics, though there is an exciting proposal [[https://github.com/golang/go/issues/73787][#73787]]
+
+The [[https://pkg.go.dev/simd/archsimd][simd/archsimd]] (amd64) package is available in Go 1.26 RC2
+
+Until then we can write Go assembly code
+
+.code example/simd-sum/sum/sum.go
+
+    package main
+
+    import "perf/example/simd-sum/sum"
+
+    func main() {
+        sum.Vectors(make([]int64, 100_000))
+    }
+
+* SISD in assembly
+
+: But first, let's see what a scalar version looks like in assembler.
+: We can disassemble the binary with objdump tool and stare a bit at the loop because that's where the main logic lives.
+
+Go 1.25.5 generates the following amd64 assembly code for the scalar loop
+
+    $ GOOS=linux GOARCH=amd64 go build -o myprog main.go
+    $ go tool objdump -s sum.Scalars myprog
+
+    Memory address  Assembly instruction
+       0x46fbe9      ↙ JMP  0x46fbf2
+       0x46fbeb     ↓  ADDQ 0(AX)(CX*8), DX ↖     ; sum += input[i]
+       0x46fbef     ↓  INCQ CX               ↑    ; i++
+       0x46fbf2      ↘ CMPQ BX, CX           ↑    ; i < len(input)
+       0x46fbf5        JG   0x46fbeb        ↗
+
+Scalar loop
+
+    var sum int64
+    for i := 0; i < len(input); i++ {
+        sum += input[i]
+    }
+
+* ADDQ
+
+ADD Quadword adds 64-bit integers stored in _DX_ and a memory address
+`offset`+`reg1`+`reg2*scale`, and places the result in the _DX_
+
+    ADDQ 0(AX)(CX*8), DX    ; DX = *(0 + AX + CX*8) + DX = input[i] + sum = 1 + 0
+
+- _DX_ is where the *sum* is kept
+- _AX_ holds a pointer to the underlying array (the memory address of the first element)
+- _CX_ represents an array index *i*
+- _8_ is the size of `int64` in bytes
+
+If you're wondering how could all those 16-bit registers hold 64 bits, Go uses simplified register names, so _AX_ is equivalent of _RAX_ here because the instruction suffix *Q* forces the 64-bit size of the operation
+
+* SIMD in assembly
+
+: We need a vector loop implemented in assembler. Here is my attempt at it.
+
+Here is a manually written assembly code of the vector loop
+
+    $ grep -A8 vector_loop: ./sum/sum.s
+    vector_loop:
+        ADDQ    $0x00000004, BX          ; i += 4
+        CMPQ    DX, BX                   ; i < loopEnd
+        JLE     vector_loop_end
+        VMOVDQU (AX)(BX*8), Y1           ; y1 := input[i:i+4]
+        VPADDQ  Y0, Y1, Y0               ; y0 += y1
+        JMP     vector_loop
+    vector_loop_end:
+
+Vector loop (pseudocode)
+
+    input := []int64{1, 2, 3, 4, 5, 6, 7, 8, ... }
+    y0 := input[0:4]                     // [4,  3,  2, 1]
+    for i := 4; i < loopEnd; i += 4 {
+        y1 := input[i:i+4]               // [8,  7,  6, 5]
+        y0 += y1                         // [12, 10, 8, 6]
+    }
+
+* VPADDQ
+
+Vector extension Packed ADD Quadword adds 64-bit elements of vector registers _Y0_ and _Y1_, storing the result in the _Y0_
+
+    VPADDQ  Y0, Y1, Y0    ; y0 += y1 = y0 + input[i:i+4] = [4, 3, 2, 1] + [8, 7, 6, 5]
+
+- _Y0_ and _Y1_ are 256-bit registers, that's why we can fit four `int64` elements there
+- We could fit eight integers if we used 512-bit ZMM registers
+
+* VMOVDQU
+
+: But how can we move the array elements into the vector registers?
+: Behold the VMOVDQU instruction. It stands for ...
+
+Vector extension MOVe Double Quadword Unaligned copies the four 64-bit integers from a possibly unaligned memory address stored in the _AX_ to the vector register _Y1_
+
+    VMOVDQU (AX)(BX*8), Y1    ; Y1 = *(AX + BX*8) = input[i:i+4] = [8, 7, 6, 5]
+
+- _AX_ holds a pointer to the underlying array
+- _BX_ represents an array index *i*
+- _8_ is the size of `int64` in bytes
+
+Assuming the array is stored at memory address `0xc000054760` and `i=4`,
+we'll copy 256 bits (Y1 size) starting from address `0xc000054760`+`4`*`8`
+
+    address: 0xc000054760
+             ⬇️
+    array:   [1, 2, 3, 4, 5, 6, 7, 8, ... ]    =>    Y1 = [8, 7, 6, 5]
+    index:    0  1  2  3  4  5  6  7
+                          ⬆️
+                          0xc000054760 + 4 * 8
+
+: ---
+: Footnote: Unaligned means not starting at a memory address that is a multiple of the vector's size in bytes.
+: We don't use VMOVDQA (the aligned version) since we don't know if the array's address is aligned to 32.
+: Despite its "double quadword" (128-bit vector) naming, the instruction is capable of moving 256 bits.
+:
+: Note, vector registers store array elements in the reverse order.
+
+* Horizontal reduction
+
+: Eventually we need to somehow return a scalar result from the sum.Vectors() function.
+: To do that, we employ a technique called a horizontal reduction summation.
+
+We summarize the Y0 = [12, 10, 8, 6] vector by adding its halfes [12, 10] and [8, 6]
+
+    $ grep -A5 VEXTRACTI128 ./sum/sum.s
+    VEXTRACTI128 $0x01, Y0, X1        ; X1 = [12, 10]
+    VPADDQ       X0, X1, X0           ; X0 = X0 + X1 = [8, 6] + [12, 10] = [20, 16]
+    VPSRLDQ      $0x08, X0, X1        ; X1 = [0, 20]
+    VPADDQ       X0, X1, X0           ; X0 = X0 + X1 = [20, 16] + [0, 20] = [20, 36]
+    VMOVQ        X0, DX               ; DX = 36 🏁
+    VZEROUPPER
+
+- VEXTRACTI128 copies left half of _Y0_ (bits 128-255) to a 128-bit XMM register _X1_
+- VPSRLDQ shifts _X0_'s bits right by _8_ bytes, fills an empty space with zeros, stores the result in _X1_
+- VMOVQ copies the lower quadword (bits 0-63) from vector _X0_ to a scalar register _DX_
+- VZEROUPPER clears bits 128-255 in YMM registers to prevent a potential [[https://www.felixcloutier.com/x86/vzeroupper][performance penalty]]
+
+: ---
+: Footnote: From what I understand, we should place VZEROUPPER right after we're done using the SIMD instructions.
+
+* sum.Scalars: arguments in the registers
+
+: How did the array pointer and the slice length ended up in the registers?
+
+Go ensures that all three parts of the slice header (array pointer, length, and capacity) are in the registers _AX_, _BX_, _CX_ respectively before calling the `sum.Scalars` function
+
+    $ go tool objdump -s main.main myprog
+    0x46fbc0        CALL runtime.makeslice(SB)    ; Memory address of the array is in AX.
+    0x46fbc5        MOVL $0x186a0, BX             ; Slice length 100,000 is in BX.
+    0x46fbca        MOVQ BX, CX                   ; Slice capacity is in CX.
+    0x46fbcd        CALL perf/example/simd-sum/sum.Scalars(SB)
+
+* sum.Vectors: arguments on the stack
+
+: From looking at the sum.Vectors() assembly, we can see that the arguments are passed on the stack.
+: Note, prior to Go 1.17 a caller used to push all the arguments on the stack.
+
+Since `sum.Vectors` function's assembly is written by hand, the compiler defaulted to using the stack to pass the slice header
+
+    $ grep -A2 TEXT ./sum/sum.s
+    TEXT ·Vectors(SB), NOSPLIT, $0-32
+        MOVQ input_base+0(FP), AX
+        MOVQ input_len+8(FP), CX
+
+The arguments are written as offsets to the _FP_ pseudo-register:
+
+- `input_base+0(FP)` is a pointer to the underlying array
+- `input_len+8(FP)` is a length of the `input`[]int64` slice
+
+    |          ...            | caller's frame
+    | input_len+8(FP)         |
+    | input_base+0(FP)        | arguments to the sum.Vectors function
+    |-------------------------| FP
+    | return address (PC)     |
+    +-------------------------+
+    |          ...            | callee's frame
+
+: ---
+: Footnote: Normally, Go inserts code to check if the stack needs to grow, but NOSPLIT disables this.
+: The stack frame for a function, plus anything it calls, must fit in the spare space remaining in the current stack segment (its minimum size is 2 KB).
+:
+: TEXT argument "$0-32" tells that the stack frame size is zero, and the arguments size is 32 bytes (stack header and a return value).
+:
+: Arguments are stored in the caller's stack frame.
+
+* avo 🥑
+
+The [[https://github.com/mmcloughlin/avo][avo]] package greatly simplifies writing Go assembly:
+
+- declares the function using its signature (the stack frame size and arguments size were calculated for us)
+- allocates registers, e.g., `asm.GP64()` calls gave us _AX_ and _CX_
+- loads the function arguments into registers, ensuring memory offsets are correct
+- stores the function return value, e.g., `asm.ReturnIndex(0)`
+
+    $ grep -A5 TEXT ./sum/asm.go
+    asm.TEXT("Vectors", asm.NOSPLIT, "func(input []int64) int64") // TEXT ·Vectors(SB), NOSPLIT, $0-32
+
+    input := asm.GP64()
+    inputLen := asm.GP64()
+    asm.Load(asm.Param("input").Base(), input)                    // MOVQ input_base+0(FP), AX
+    asm.Load(asm.Param("input").Len(), inputLen)                  // MOVQ input_len+8(FP), CX
+
+* Benchmarks
+
+SIMD sum is two times faster than SISD in my experiment
+
+    $ go test -bench=^ -count=10 ./sum | tee bench.txt
+    goos: darwin
+    goarch: amd64
+    pkg: perf/example/simd-sum/sum
+    cpu: Intel(R) Core(TM) i5-10600 CPU @ 3.30GHz
+    BenchmarkScalars-12    	   39687	     29860 ns/op
+    BenchmarkScalars-12    	   39760	     29869 ns/op
+    ...
+    BenchmarkVectors-12    	   85714	     13748 ns/op
+    BenchmarkVectors-12    	   85068	     14067 ns/op
+
+    $ grep Benchmark bench.txt | sed 's/Benchmark[A-z]*/BenchmarkSum/g' | split -l 10 -a 1 - bench_
+
+    $ benchstat bench_a bench_b
+    name    old time/op  new time/op  delta
+    Sum-12  29.8µs ± 1%  13.7µs ± 3%  -53.89%  (p=0.000 n=9+10)
+
+* Takeaways
+
+- SIMD can speed up Go code (x2 faster sum of `[]int64` on Intel i5-10600)
+- keep in mind that vector registers store array elements in the reverse order, for example,
+  *[1,*2,*3,*4]* in memory but *[4,*3,*2,*1]* in a register
+- take a look at `simd/archsimd` package coming in Go 1.26 (check out [[https://marselester.com/go-archsimd-preview.html][Go archsimd preview]])
+- consider using [[https://github.com/mmcloughlin/avo][avo]] if you need to write Go assembly (check out [[https://marselester.com/hello-world-in-avo.html][Hello World in avo]] and [[https://marselester.com/intro-to-simd-in-avo.html][Intro to SIMD in avo]]) in my blog
