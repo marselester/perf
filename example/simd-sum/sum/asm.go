@@ -10,7 +10,7 @@ import (
 //go:generate go run asm.go -out sum.s -stubs sum.go
 
 func main() {
-	asm.TEXT("Vectors", asm.NOSPLIT, "func(input []int64) int64")
+	asm.TEXT("Assembly", asm.NOSPLIT, "func(input []int64) int64")
 
 	input := asm.GP64()
 	inputLen := asm.GP64()

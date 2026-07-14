@@ -2,9 +2,9 @@
 
 #include "textflag.h"
 
-// func Vectors(input []int64) int64
+// func Assembly(input []int64) int64
 // Requires: AVX, AVX2
-TEXT ·Vectors(SB), NOSPLIT, $0-32
+TEXT ·Assembly(SB), NOSPLIT, $0-32
 	MOVQ input_base+0(FP), AX
 	MOVQ input_len+8(FP), CX
 	XORQ DX, DX

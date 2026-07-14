@@ -1,6 +1,6 @@
 module perf
 
-go 1.25.5
+go 1.26.4
 
 require (
 	github.com/mmcloughlin/avo v0.6.1-0.20260101053806-c096992c06ff // indirect

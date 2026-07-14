@@ -2,4 +2,4 @@
 
 package sum
 
-func Vectors(input []int64) int64
+func Assembly(input []int64) int64

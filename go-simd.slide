@@ -1,6 +1,6 @@
 Intro to SIMD in Go
 
-11 May 2026
+20 July 2026
 
 Marsel Mavletkulov
 @marselester
@@ -11,7 +11,7 @@ Marsel Mavletkulov
 
 SIMD stands for Single Instruction Multiple Data
 
-It is a technique to process more data in a single CPU instruction, e.g., we can add these two vectors in 1 CPU cycle
+It is a technique to process more data in a single CPU instruction, e.g., we can add these two vectors in 1 instruction (1 CPU cycle)
 
     ADD [4, 3, 2, 1], [8, 7, 6, 5]
 
@@ -25,11 +25,15 @@ It would take 4 instructions to achieve the same result in a scalar mode
 
 Adding four pairs of integers per CPU cycle makes a program run faster 🏃🏽‍♂️‍➡️ compared to just one pair per cycle 🚶🏽‍♂️‍➡️
 
+* Go
+
+: Let's see how we can sum the numbers in Go.
+
 * SISD in Go
 
 The easiest way to add up the numbers in a scalar mode is to sum one integer at a time in the loop
 
-.code example/simd-sum/sum/scalar.go
+.code example/simd-sum/sum/loop.go
 
 .code example/simd-sum/main.go
 
@@ -37,31 +41,186 @@ The easiest way to add up the numbers in a scalar mode is to sum one integer at 
 
 : What about SIMD in Go?
 
-As of now Go doesn't support SIMD intrinsics, though there is an exciting proposal [[https://github.com/golang/go/issues/73787][#73787]]
+Go has experimental SIMD intrinsics via the [[https://pkg.go.dev/simd/archsimd][archsimd]] package (proposal [[https://github.com/golang/go/issues/73787][#73787]]) that currently supports amd64, arm64, wasm
 
-The [[https://pkg.go.dev/simd/archsimd][simd/archsimd]] (amd64) package is available in Go 1.26 RC2
-
-Until then we can write Go assembly code
-
-.code example/simd-sum/sum/sum.go
-
-    package main
-
-    import "perf/example/simd-sum/sum"
-
-    func main() {
-        sum.Vectors(make([]int64, 100_000))
+    i := 0
+    loopEnd := len(input) - len(input)%4
+    if loopEnd >= 8 {
+        y0 := archsimd.LoadInt64x4Slice(input)                 // y0 := input[0:4]
+        for i += 4; i < loopEnd; i += 4 {                      // Vector loop.
+            y1 := archsimd.LoadInt64x4Slice(input[i : i+4])    // y1 := input[i:i+4]
+            y0 = y0.Add(y1)                                    // y0 += y1
+        }
+                                                               // Horizontal reduction.
+        x0, x1 := y0.GetLo(), y0.GetHi()                       // x0, x1 := y0[0:2], y0[2:4]
+        x0 = x0.Add(x1)                                        // x0 += x1
+        sum = x0.GetElem(0) + x0.GetElem(1)                    // sum = x0[0] + x0[1]
     }
+
+    for ; i < len(input); i++ {
+        sum += input[i]
+    }
+
+: ---
+: Footnote:
+: Here we have a vector loop that adds 4 pairs of integers per iteration, and a scalar loop that sums the rest that SIMD couldn't handle.
+
+* CPU feature detection
+
+The example implied the CPU has a 256-bit vector register to load four 64-bit integers
+
+    y0 := archsimd.LoadInt64x4Slice(input)
+
+If it doesn't, the program would crash, so we'd better check it at runtime
+
+    if archsimd.X86.AVX() {
+        xmm0 := archsimd.LoadInt64x2Slice(input)
+        // XMM 128-bit registers are supported...
+    }
+
+    if archsimd.X86.AVX2() {
+        ymm0 := archsimd.LoadInt64x4Slice(input)
+        // YMM 256-bit registers are supported...
+    }
+
+    if archsimd.X86.AVX512() {
+        zmm0 := archsimd.LoadInt64x8Slice(input)
+        // ZMM 512-bit registers are supported...
+    }
+
+* Bounds checks
+
+: If we looked at assembly instructions used by the compiler, we would see that it inserted the bounds checks in both loops for our own safety.
+
+The compiler inserted the bounds checks in both loops
+
+    $ GOEXPERIMENT=simd go build -gcflags -S ./sum/intrinsics_bounds_checks.go 2>&1 \
+        | grep 'runtime.panicBounds(SB)'
+    intrinsics_bounds_checks.go:23	CALL	runtime.panicBounds(SB)
+    intrinsics_bounds_checks.go:12	CALL	runtime.panicBounds(SB)
+    intrinsics_bounds_checks.go:12	CALL	runtime.panicBounds(SB)
+
+In [[https://marselester.com/go-archsimd-preview.html][my benchmarks]] the code was ~14% faster without them: lines 12, 23 are the culprits
+
+    for i += 4; i < loopEnd; i += 4 {
+        y1 := archsimd.LoadInt64x4Slice(input[i : i+4]) // Line 12 🐌
+        y0 = y0.Add(y1)
+    }
+
+    for ; i < len(input); i++ {
+        sum += input[i]                                 // Line 23 🐌
+    }
+
+* Bounds checks overhead
+
+: Due to the hidden bounds checks, every iteration executes extra compare-and-branch instructions (LEA calculates a look-ahead index i+4 that is checked against the slice boundaries with CMP i+4 > cap(input)).
+
+Hidden bounds checks add compare-and-branch instructions per iteration
+
+    $ GOEXPERIMENT=simd go build -gcflags -d=ssa/check_bce ./sum/intrinsics_bounds_checks.go
+    intrinsics_bounds_checks.go:12:41: Found IsSliceInBounds
+    intrinsics_bounds_checks.go:23:15: Found IsInBounds
+
+`input[i:i+4]` corresponds to *IsSliceInBounds*, `input[i]` to *IsInBounds*
+
+    for i += 4; i < loopEnd; i += 4 {
+        if i+4 > cap(input) { panic("index out of range") } // ⚠️ IsSliceInBounds: capacity
+        if i > i+4 { panic("index out of range") }          // ⚠️ IsSliceInBounds: low <= high
+
+        y1 := archsimd.LoadInt64x4Slice(input[i : i+4])
+        y0 = y0.Add(y1)
+    }
+
+    for ; i < len(input); i++ {
+        if i < 0 { panic("index out of range") }            // ⚠️ IsInBounds: non-negative (shared i)
+
+        sum += input[i]
+    }
+
+* Bounds checks elimination: scalar loop
+
+We can eliminate *IsInBounds* check from the scalar loop with resliced *tail* variable:
+*range*tail* produces provably-in-bounds indices
+
+    tail := input[i:]           // 👌 IsSliceInBounds
+    for _, v := range tail {
+        sum += v                // 👌 no bounds check
+    }
+
+    // before
+    for ; i < len(input); i++ {
+        sum += input[i]         // ⚠️ IsInBounds
+    }
+
+We can assert the lower bound `i>=0` so the check disappears
+
+    if i < 0 { i = 0 }
+    for ; i < len(input); i++ {
+        sum += input[i]         // 👌 no bounds check
+    }
+
+* Bounds checks elimination: vector loop
+
+: I've tried to apply a similar approach to the vector loop, but the checks stayed in place, so I resorted to the *unsafe* package to get rid of them.
+: The unsafe.Pointer type allows us to defeat the type system and read/write arbitrary memory.
+: unsafe.Add(inputData, i*8) calculates the memory address of the i-th array element (beginning of the next chunk of numbers), i.e., inputData + i*8 where 8 is the size of int64 in bytes.
+
+Similar approach didn't work on the vector loop, so I resorted to raw pointer arithmetic
+
+- `unsafe.Pointer(&input[0])` points to the first item of the underlying array
+- `unsafe.Add(inputData,`i*8)` points at *i*-th item (`i*8` bytes from the first element)
+- `archsimd.LoadInt64x4(chunk)` loads `[4]int64` chunk of numbers from *i*-th index
+
+    inputData := unsafe.Pointer(&input[0])
+    for i += 4; i < loopEnd; i += 4 {
+        chunk := (*[4]int64)(unsafe.Add(inputData, i*8))
+        y1 := archsimd.LoadInt64x4(chunk)               // 👌 no bounds check
+        y0 = y0.Add(y1)
+    }
+
+    // before
+    for i += 4; i < loopEnd; i += 4 {
+        y1 := archsimd.LoadInt64x4Slice(input[i : i+4]) // ⚠️ IsSliceInBounds
+        y0 = y0.Add(y1)
+    }
+
+* Benchmarks: intrinsics
+
+SIMD *sum.Intrinsics()* is two times faster than SISD scalar *sum.Loop()*
+
+    $ GOEXPERIMENT=simd go test -bench='BenchmarkLoop|BenchmarkIntrinsics' -count=10 ./sum \
+        | tee bench.txt
+    goos: darwin
+    goarch: amd64
+    pkg: perf/example/simd-sum/sum
+    cpu: Intel(R) Core(TM) i5-10600 CPU @ 3.30GHz
+    BenchmarkLoop-12          	   40701	     29145 ns/op
+    BenchmarkLoop-12          	   40596	     29210 ns/op
+    ...
+    BenchmarkIntrinsics-12    	   92397	     13106 ns/op
+    BenchmarkIntrinsics-12    	   88144	     12935 ns/op
+
+    $ grep Benchmark bench.txt | sed 's/Benchmark[A-z]*/BenchmarkSum/g' \
+        | split -l 10 -a 1 - bench_
+
+    $ benchstat bench_a bench_b
+    name    old time/op  new time/op  delta
+    Sum-12  29.2µs ± 1%  13.2µs ± 2%  -54.60%  (p=0.000 n=9+10)
+
+* Assembly
+
+: archsimd is the high-level way to work with SIMD, and assembly is the low-level way which avoids the bounds checks entirely.
+: Let's see how it works under the hood.
 
 * SISD in assembly
 
-: But first, let's see what a scalar version looks like in assembler.
+: Let's see what a scalar version looks like in assembly code.
 : We can disassemble the binary with objdump tool and stare a bit at the loop because that's where the main logic lives.
 
-Go 1.25.5 generates the following amd64 assembly code for the scalar loop
+Go generates the following amd64 assembly code for the scalar loop
 
     $ GOOS=linux GOARCH=amd64 go build -o myprog main.go
-    $ go tool objdump -s sum.Scalars myprog
+    $ go tool objdump -s sum.Loop myprog
 
     Memory address  Assembly instruction
        0x46fbe9      ↙ JMP  0x46fbf2
@@ -89,11 +248,11 @@ ADD Quadword adds 64-bit integers stored in _DX_ and a memory address
 - _CX_ represents an array index *i*
 - _8_ is the size of `int64` in bytes
 
-If you're wondering how could all those 16-bit registers hold 64 bits, Go uses simplified register names, so _AX_ is equivalent of _RAX_ here because the instruction suffix *Q* forces the 64-bit size of the operation
+If you're wondering how all those 16-bit registers could hold 64 bits, Go uses width-independent register names, so _AX_ names the full register _RAX_. The instruction suffix *Q* in *ADDQ* then means a 64-bit operation
 
 * SIMD in assembly
 
-: We need a vector loop implemented in assembler. Here is my attempt at it.
+: We need a vector loop implemented in assembly. Here is my attempt at it.
 
 Here is a manually written assembly code of the vector loop
 
@@ -143,24 +302,24 @@ we'll copy 256 bits (Y1 size) starting from address `0xc000054760`+`4`*`8`
 
     address: 0xc000054760
              ⬇️
-    array:   [1, 2, 3, 4, 5, 6, 7, 8, ... ]    =>    Y1 = [8, 7, 6, 5]
-    index:    0  1  2  3  4  5  6  7
+    array:   [1, 2, 3, 4, 5, 6, 7, 8, ... ]    =>    Y1:   [8, 7, 6, 5]
+    index:    0  1  2  3  4  5  6  7                 lane:  3  2  1  0
                           ⬆️
                           0xc000054760 + 4 * 8
 
 : ---
 : Footnote: Unaligned means not starting at a memory address that is a multiple of the vector's size in bytes.
-: We don't use VMOVDQA (the aligned version) since we don't know if the array's address is aligned to 32.
+: We don't use VMOVDQA (the aligned version) since we don't know if the array's address is aligned to 32 bytes (256 / 8 = 32 bytes).
 : Despite its "double quadword" (128-bit vector) naming, the instruction is capable of moving 256 bits.
 :
-: Note, vector registers store array elements in the reverse order.
+: Note, vector registers store array elements in what looks like reverse order because we depict the highest lane on the left side.
 
 * Horizontal reduction
 
-: Eventually we need to somehow return a scalar result from the sum.Vectors() function.
-: To do that, we employ a technique called a horizontal reduction summation.
+: Eventually we need to somehow return a scalar result from the sum.Assembly() function.
+: To do that, we employ a technique called a horizontal reduction (summation).
 
-We summarize the Y0 = [12, 10, 8, 6] vector by adding its halfes [12, 10] and [8, 6]
+We summarize the Y0 = [12, 10, 8, 6] vector by adding its halves [12, 10] and [8, 6]
 
     $ grep -A5 VEXTRACTI128 ./sum/sum.s
     VEXTRACTI128 $0x01, Y0, X1        ; X1 = [12, 10]
@@ -176,40 +335,40 @@ We summarize the Y0 = [12, 10, 8, 6] vector by adding its halfes [12, 10] and [8
 - VZEROUPPER clears bits 128-255 in YMM registers to prevent a potential [[https://www.felixcloutier.com/x86/vzeroupper][performance penalty]]
 
 : ---
-: Footnote: From what I understand, we should place VZEROUPPER right after we're done using the SIMD instructions.
+: Footnote: We should place VZEROUPPER right after we're done using the SIMD instructions.
 
-* sum.Scalars: arguments in the registers
+* sum.Loop: arguments in the registers
 
-: How did the array pointer and the slice length ended up in the registers?
+: How did the array pointer and the slice length end up in the registers?
 
-Go ensures that all three parts of the slice header (array pointer, length, and capacity) are in the registers _AX_, _BX_, _CX_ respectively before calling the `sum.Scalars` function
+Go ensures that all three parts of the slice header (array pointer, length, and capacity) are in the registers _AX_, _BX_, _CX_ respectively before calling the `sum.Loop` function
 
     $ go tool objdump -s main.main myprog
     0x46fbc0        CALL runtime.makeslice(SB)    ; Memory address of the array is in AX.
     0x46fbc5        MOVL $0x186a0, BX             ; Slice length 100,000 is in BX.
     0x46fbca        MOVQ BX, CX                   ; Slice capacity is in CX.
-    0x46fbcd        CALL perf/example/simd-sum/sum.Scalars(SB)
+    0x46fbcd        CALL perf/example/simd-sum/sum.Loop(SB)
 
-* sum.Vectors: arguments on the stack
+* sum.Assembly: arguments on the stack
 
-: From looking at the sum.Vectors() assembly, we can see that the arguments are passed on the stack.
+: From looking at the sum.Assembly() code, we can see that the arguments are passed on the stack.
 : Note, prior to Go 1.17 a caller used to push all the arguments on the stack.
 
-Since `sum.Vectors` function's assembly is written by hand, the compiler defaulted to using the stack to pass the slice header
+Since `sum.Assembly` function's code is written by hand, the compiler defaulted to using the stack to pass the slice header
 
     $ grep -A2 TEXT ./sum/sum.s
-    TEXT ·Vectors(SB), NOSPLIT, $0-32
+    TEXT ·Assembly(SB), NOSPLIT, $0-32
         MOVQ input_base+0(FP), AX
         MOVQ input_len+8(FP), CX
 
 The arguments are written as offsets to the _FP_ pseudo-register:
 
 - `input_base+0(FP)` is a pointer to the underlying array
-- `input_len+8(FP)` is a length of the `input`[]int64` slice
+- `input_len+8(FP)` is the length of the `input`[]int64` slice
 
     |          ...            | caller's frame
     | input_len+8(FP)         |
-    | input_base+0(FP)        | arguments to the sum.Vectors function
+    | input_base+0(FP)        | arguments to the sum.Assembly function
     |-------------------------| FP
     | return address (PC)     |
     +-------------------------+
@@ -219,7 +378,7 @@ The arguments are written as offsets to the _FP_ pseudo-register:
 : Footnote: Normally, Go inserts code to check if the stack needs to grow, but NOSPLIT disables this.
 : The stack frame for a function, plus anything it calls, must fit in the spare space remaining in the current stack segment (its minimum size is 2 KB).
 :
-: TEXT argument "$0-32" tells that the stack frame size is zero, and the arguments size is 32 bytes (stack header and a return value).
+: TEXT argument "$0-32" tells that the stack frame size is zero, and the arguments size is 32 bytes (slice header and a return value).
 :
 : Arguments are stored in the caller's stack frame.
 
@@ -233,38 +392,39 @@ The [[https://github.com/mmcloughlin/avo][avo]] package greatly simplifies writi
 - stores the function return value, e.g., `asm.ReturnIndex(0)`
 
     $ grep -A5 TEXT ./sum/asm.go
-    asm.TEXT("Vectors", asm.NOSPLIT, "func(input []int64) int64") // TEXT ·Vectors(SB), NOSPLIT, $0-32
+    asm.TEXT("Assembly", asm.NOSPLIT, "func(input []int64) int64") // TEXT ·Assembly(SB),NOSPLIT,$0-32
 
     input := asm.GP64()
     inputLen := asm.GP64()
-    asm.Load(asm.Param("input").Base(), input)                    // MOVQ input_base+0(FP), AX
-    asm.Load(asm.Param("input").Len(), inputLen)                  // MOVQ input_len+8(FP), CX
+    asm.Load(asm.Param("input").Base(), input)                     // MOVQ input_base+0(FP), AX
+    asm.Load(asm.Param("input").Len(), inputLen)                   // MOVQ input_len+8(FP), CX
 
-* Benchmarks
+* Benchmarks: assembly
 
-SIMD sum is two times faster than SISD in my experiment
+SIMD *sum.Assembly()* is two times faster than SISD scalar *sum.Loop()*
 
-    $ go test -bench=^ -count=10 ./sum | tee bench.txt
+    $ GOEXPERIMENT=simd go test -bench='BenchmarkLoop|BenchmarkAssembly' -count=10 ./sum \
+        | tee bench.txt
     goos: darwin
     goarch: amd64
     pkg: perf/example/simd-sum/sum
     cpu: Intel(R) Core(TM) i5-10600 CPU @ 3.30GHz
-    BenchmarkScalars-12    	   39687	     29860 ns/op
-    BenchmarkScalars-12    	   39760	     29869 ns/op
+    BenchmarkLoop-12        	   40767	     29012 ns/op
+    BenchmarkLoop-12        	   40813	     29012 ns/op
     ...
-    BenchmarkVectors-12    	   85714	     13748 ns/op
-    BenchmarkVectors-12    	   85068	     14067 ns/op
+    BenchmarkAssembly-12    	   81849	     13406 ns/op
+    BenchmarkAssembly-12    	   93218	     13396 ns/op
 
-    $ grep Benchmark bench.txt | sed 's/Benchmark[A-z]*/BenchmarkSum/g' | split -l 10 -a 1 - bench_
+    $ grep Benchmark bench.txt | sed 's/Benchmark[A-z]*/BenchmarkSum/g' \
+        | split -l 10 -a 1 - bench_
 
     $ benchstat bench_a bench_b
     name    old time/op  new time/op  delta
-    Sum-12  29.8µs ± 1%  13.7µs ± 3%  -53.89%  (p=0.000 n=9+10)
+    Sum-12  29.2µs ± 1%  13.5µs ± 2%  -53.81%  (p=0.000 n=10+9)
 
 * Takeaways
 
 - SIMD can speed up Go code (x2 faster sum of `[]int64` on Intel i5-10600)
-- keep in mind that vector registers store array elements in the reverse order, for example,
-  *[1,*2,*3,*4]* in memory but *[4,*3,*2,*1]* in a register
-- take a look at `simd/archsimd` package coming in Go 1.26 (check out [[https://marselester.com/go-archsimd-preview.html][Go archsimd preview]])
+- prefer `archsimd` over hand writing assembly (check out [[https://marselester.com/go-archsimd-preview.html][Go archsimd preview]]), beware of bounds checks in hot loops
 - consider using [[https://github.com/mmcloughlin/avo][avo]] if you need to write Go assembly (check out [[https://marselester.com/hello-world-in-avo.html][Hello World in avo]] and [[https://marselester.com/intro-to-simd-in-avo.html][Intro to SIMD in avo]]) in my blog
+- note that vector registers look reversed when written out, for example, *[1,*2,*3,*4]* in memory but *[4,*3,*2,*1]* in a register because we show it from the highest lane to the lowest *[lane3,*lane2,*lane1,*lane0]*
