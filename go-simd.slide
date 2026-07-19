@@ -41,14 +41,14 @@ The easiest way to add up the numbers in a scalar mode is to sum one integer at 
 
 : What about SIMD in Go?
 
-Go has experimental SIMD intrinsics via the [[https://pkg.go.dev/simd/archsimd][archsimd]] package (proposal [[https://github.com/golang/go/issues/73787][#73787]]) that currently supports amd64, arm64, wasm
+Go has experimental SIMD intrinsics via the [[https://pkg.go.dev/simd/archsimd@go1.27rc2][archsimd]] package (proposal [[https://github.com/golang/go/issues/73787][#73787]]) that supports amd64, arm64, wasm (Go 1.27rc2)
 
     i := 0
     loopEnd := len(input) - len(input)%4
     if loopEnd >= 8 {
-        y0 := archsimd.LoadInt64x4Slice(input)                 // y0 := input[0:4]
+        y0 := archsimd.LoadInt64x4(input)                      // y0 := input[0:4]
         for i += 4; i < loopEnd; i += 4 {                      // Vector loop.
-            y1 := archsimd.LoadInt64x4Slice(input[i : i+4])    // y1 := input[i:i+4]
+            y1 := archsimd.LoadInt64x4(input[i : i+4])         // y1 := input[i:i+4]
             y0 = y0.Add(y1)                                    // y0 += y1
         }
                                                                // Horizontal reduction.
@@ -67,26 +67,21 @@ Go has experimental SIMD intrinsics via the [[https://pkg.go.dev/simd/archsimd][
 
 * CPU feature detection
 
-The example implied the CPU has a 256-bit vector register to load four 64-bit integers
-
-    y0 := archsimd.LoadInt64x4Slice(input)
-
-If it doesn't, the program would crash, so we'd better check it at runtime
+`LoadInt64x4(input)` implies the CPU has a 256-bit vector register to load four 64-bit integers. If it doesn't, the program would crash, so we'd better check it at runtime.
 
     if archsimd.X86.AVX() {
-        xmm0 := archsimd.LoadInt64x2Slice(input)
-        // XMM 128-bit registers are supported...
+        xmm0 := archsimd.LoadInt64x2(input) // XMM 128-bit registers are supported...
     }
 
     if archsimd.X86.AVX2() {
-        ymm0 := archsimd.LoadInt64x4Slice(input)
-        // YMM 256-bit registers are supported...
+        ymm0 := archsimd.LoadInt64x4(input) // YMM 256-bit registers are supported...
     }
 
     if archsimd.X86.AVX512() {
-        zmm0 := archsimd.LoadInt64x8Slice(input)
-        // ZMM 512-bit registers are supported...
+        zmm0 := archsimd.LoadInt64x8(input) // ZMM 512-bit registers are supported...
     }
+
+[[https://pkg.go.dev/simd@go1.27rc2][simd]] is a portable, vector-size-agnostic package built on archsimd, so we could skip these manual checks
 
 * Bounds checks
 
@@ -103,12 +98,12 @@ The compiler inserted the bounds checks in both loops
 In [[https://marselester.com/go-archsimd-preview.html][my benchmarks]] the code was ~14% faster without them: lines 12, 23 are the culprits
 
     for i += 4; i < loopEnd; i += 4 {
-        y1 := archsimd.LoadInt64x4Slice(input[i : i+4]) // Line 12 🐌
+        y1 := archsimd.LoadInt64x4(input[i : i+4]) // Line 12 🐌
         y0 = y0.Add(y1)
     }
 
     for ; i < len(input); i++ {
-        sum += input[i]                                 // Line 23 🐌
+        sum += input[i]                            // Line 23 🐌
     }
 
 * Bounds checks overhead
@@ -118,7 +113,7 @@ In [[https://marselester.com/go-archsimd-preview.html][my benchmarks]] the code 
 Hidden bounds checks add compare-and-branch instructions per iteration
 
     $ GOEXPERIMENT=simd go build -gcflags -d=ssa/check_bce ./sum/intrinsics_bounds_checks.go
-    intrinsics_bounds_checks.go:12:41: Found IsSliceInBounds
+    intrinsics_bounds_checks.go:12:36: Found IsSliceInBounds
     intrinsics_bounds_checks.go:23:15: Found IsInBounds
 
 `input[i:i+4]` corresponds to *IsSliceInBounds*, `input[i]` to *IsInBounds*
@@ -127,7 +122,7 @@ Hidden bounds checks add compare-and-branch instructions per iteration
         if i+4 > cap(input) { panic("index out of range") } // ⚠️ IsSliceInBounds: capacity
         if i > i+4 { panic("index out of range") }          // ⚠️ IsSliceInBounds: low <= high
 
-        y1 := archsimd.LoadInt64x4Slice(input[i : i+4])
+        y1 := archsimd.LoadInt64x4(input[i : i+4])
         y0 = y0.Add(y1)
     }
 
@@ -142,21 +137,21 @@ Hidden bounds checks add compare-and-branch instructions per iteration
 We can eliminate *IsInBounds* check from the scalar loop with resliced *tail* variable:
 *range*tail* produces provably-in-bounds indices
 
-    tail := input[i:]           // 👌 IsSliceInBounds
+    tail := input[i:]   // 👌 IsSliceInBounds
     for _, v := range tail {
-        sum += v                // 👌 no bounds check
+        sum += v        // 👌 no bounds check
     }
 
     // before
     for ; i < len(input); i++ {
-        sum += input[i]         // ⚠️ IsInBounds
+        sum += input[i] // ⚠️ IsInBounds
     }
 
 We can assert the lower bound `i>=0` so the check disappears
 
     if i < 0 { i = 0 }
     for ; i < len(input); i++ {
-        sum += input[i]         // 👌 no bounds check
+        sum += input[i] // 👌 no bounds check
     }
 
 * Bounds checks elimination: vector loop
@@ -169,18 +164,18 @@ Similar approach didn't work on the vector loop, so I resorted to raw pointer ar
 
 - `unsafe.Pointer(&input[0])` points to the first item of the underlying array
 - `unsafe.Add(inputData,`i*8)` points at *i*-th item (`i*8` bytes from the first element)
-- `archsimd.LoadInt64x4(chunk)` loads `[4]int64` chunk of numbers from *i*-th index
+- `archsimd.LoadInt64x4Array(chunk)` loads `[4]int64` chunk of numbers from *i*-th index
 
     inputData := unsafe.Pointer(&input[0])
     for i += 4; i < loopEnd; i += 4 {
         chunk := (*[4]int64)(unsafe.Add(inputData, i*8))
-        y1 := archsimd.LoadInt64x4(chunk)               // 👌 no bounds check
+        y1 := archsimd.LoadInt64x4Array(chunk)     // 👌 no bounds check
         y0 = y0.Add(y1)
     }
 
     // before
     for i += 4; i < loopEnd; i += 4 {
-        y1 := archsimd.LoadInt64x4Slice(input[i : i+4]) // ⚠️ IsSliceInBounds
+        y1 := archsimd.LoadInt64x4(input[i : i+4]) // ⚠️ IsSliceInBounds
         y0 = y0.Add(y1)
     }
 
@@ -425,6 +420,8 @@ SIMD *sum.Assembly()* is two times faster than SISD scalar *sum.Loop()*
 * Takeaways
 
 - SIMD can speed up Go code (x2 faster sum of `[]int64` on Intel i5-10600)
-- prefer `archsimd` over hand writing assembly (check out [[https://marselester.com/go-archsimd-preview.html][Go archsimd preview]]), beware of bounds checks in hot loops
+- used in: ML, cryptography, compression, image/audio processing, hashing, parsing
+- examples: [[https://simdjson.org][simdjson]] parses up to 25 GB/s of JSON (x25), [[https://lemire.me/blog/2026/05/23/parsing-ipv6-addresses-crazily-fast-with-avx-512/][parsing >70 M/s IPv6 addresses]] (x12), [[https://lemire.me/blog/2026/05/18/simd-accelerated-integer-to-string-conversion/][integer-to-string conversion]] (x2-x4)
+- prefer portable `simd` and `archsimd` packages over hand writing assembly, though beware of bounds checks in hot loops (check out [[https://marselester.com/go-archsimd-preview.html][Go archsimd preview]] post)
 - consider using [[https://github.com/mmcloughlin/avo][avo]] if you need to write Go assembly (check out [[https://marselester.com/hello-world-in-avo.html][Hello World in avo]] and [[https://marselester.com/intro-to-simd-in-avo.html][Intro to SIMD in avo]]) in my blog
-- note that vector registers look reversed when written out, for example, *[1,*2,*3,*4]* in memory but *[4,*3,*2,*1]* in a register because we show it from the highest lane to the lowest *[lane3,*lane2,*lane1,*lane0]*
+- note that vector registers look reversed when written out, for example, *[1,*2,*3,*4]* in memory but *[4,*3,*2,*1]* in a register because we display it from the highest lane to the lowest *[lane3,*lane2,*lane1,*lane0]*

@@ -7,9 +7,9 @@ func IntrinsicsBoundsChecks(input []int64) (sum int64) {
 	i := 0
 	loopEnd := len(input) - len(input)%4
 	if loopEnd >= 8 {
-		y0 := archsimd.LoadInt64x4Slice(input) // y0 := input[0:4]
+		y0 := archsimd.LoadInt64x4(input) // y0 := input[0:4]
 		for i += 4; i < loopEnd; i += 4 {
-			y1 := archsimd.LoadInt64x4Slice(input[i : i+4]) // y1 := input[i:i+4]
+			y1 := archsimd.LoadInt64x4(input[i : i+4]) // y1 := input[i:i+4]
 			y0 = y0.Add(y1)                                 // y0 += y1
 		}
 

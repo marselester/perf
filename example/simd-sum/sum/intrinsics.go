@@ -13,13 +13,13 @@ func Intrinsics(input []int64) (sum int64) {
 	// If we can't use two YMM vectors, fallback to a scalar sum.
 	// Otherwise keep adding YMM vectors in the vector loop.
 	if inputLen >= 8 {
-		y0 := archsimd.LoadInt64x4Slice(input)
+		y0 := archsimd.LoadInt64x4(input)
 		loopEnd := inputLen - inputLen%4
 		inputData := unsafe.Pointer(&input[0])
 
 		for i += 4; i < loopEnd; i += 4 {
 			chunk := (*[4]int64)(unsafe.Add(inputData, i*8))
-			y1 := archsimd.LoadInt64x4(chunk)
+			y1 := archsimd.LoadInt64x4Array(chunk)
 			y0 = y0.Add(y1)
 		}
 
