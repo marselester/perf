@@ -5,9 +5,11 @@ Intro to SIMD in Go
 Marsel Mavletkulov
 @marselester
 
-: Hi everyone, today we're going to talk about how to get started with SIMD in Go.
+: Hi everyone, today we're going to talk about how to get started with SIMD in Go, and then go all the way down to the assembly to see how it works.
 
 * SIMD vs SISD
+
+: First, what does SIMD even mean?
 
 SIMD stands for Single Instruction Multiple Data
 
@@ -27,9 +29,11 @@ Adding four pairs of integers per CPU cycle makes a program run faster 🏃🏽�
 
 * Go
 
-: Let's see how we can sum the numbers in Go.
+: That's the idea. Now, let's see how we can do it in Go by summing a slice of integers.
 
 * SISD in Go
+
+: We'll start simple: add one number at a time in a loop.
 
 The easiest way to add up the numbers in a scalar mode is to sum one integer at a time in the loop
 
@@ -39,7 +43,7 @@ The easiest way to add up the numbers in a scalar mode is to sum one integer at 
 
 * SIMD in Go
 
-: What about SIMD in Go?
+: That works, but it's one integer per iteration. SIMD allows us to add four at once.
 
 Go has experimental SIMD intrinsics via the [[https://pkg.go.dev/simd/archsimd@go1.27rc2][archsimd]] package (proposal [[https://github.com/golang/go/issues/73787][#73787]]) that supports amd64, arm64, wasm (Go 1.27rc2)
 
@@ -63,11 +67,15 @@ Go has experimental SIMD intrinsics via the [[https://pkg.go.dev/simd/archsimd@g
 
 : ---
 : Footnote:
-: Here we have a vector loop that adds 4 pairs of integers per iteration, and a scalar loop that sums the rest that SIMD couldn't handle.
+: Here is the same sum with archsimd: a vector loop that adds 4 pairs of integers per iteration, and a scalar loop that sums the rest that SIMD couldn't handle.
 
 * CPU feature detection
 
+: There is a catch. This assumes...
+
 `LoadInt64x4(input)` implies the CPU has a 256-bit vector register to load four 64-bit integers. If it doesn't, the program would crash, so we'd better check it at runtime.
+
+*X86* variable helps us to assertain what SIMD extensions are available
 
     if archsimd.X86.AVX() {
         xmm0 := archsimd.LoadInt64x2(input) // XMM 128-bit registers are supported...
@@ -81,10 +89,11 @@ Go has experimental SIMD intrinsics via the [[https://pkg.go.dev/simd/archsimd@g
         zmm0 := archsimd.LoadInt64x8(input) // ZMM 512-bit registers are supported...
     }
 
-[[https://pkg.go.dev/simd@go1.27rc2][simd]] is a portable, vector-size-agnostic package built on archsimd, so we could skip these manual checks
+There is however the [[https://pkg.go.dev/simd@go1.27rc2][simd]]: a portable, vector-size-agnostic package built on archsimd, which allows to skip these manual checks
 
 * Bounds checks
 
+: OK, it's correct and safe. But is it fast?
 : If we looked at assembly instructions used by the compiler, we would see that it inserted the bounds checks in both loops for our own safety.
 
 The compiler inserted the bounds checks in both loops
@@ -108,7 +117,8 @@ In [[https://marselester.com/go-archsimd-preview.html][my benchmarks]] the code 
 
 * Bounds checks overhead
 
-: Due to the hidden bounds checks, every iteration executes extra compare-and-branch instructions (LEA calculates a look-ahead index i+4 that is checked against the slice boundaries with CMP i+4 > cap(input)).
+: Those hidden checks aren't free: every iteration executes extra compare-and-branch instructions.
+: We've got IsSliceInBounds check due to re-slicing in the vector loop, and IsInBounds check caused by index access in the scalar loop.
 
 Hidden bounds checks add compare-and-branch instructions per iteration
 
@@ -134,6 +144,10 @@ Hidden bounds checks add compare-and-branch instructions per iteration
 
 * Bounds checks elimination: scalar loop
 
+: So how do we remove them? We start with the bounds check located in the scalar loop.
+: The compiler is confident that the index i is always less than the slice length, but it isn't sure that the i is non-negative, so it adds a conditional panic.
+: We can move the check outside of the loop by reslicing the input or persuade the compiler by asserting that the lower bound is non-negative.
+
 We can eliminate *IsInBounds* check from the scalar loop with resliced *tail* variable:
 *range*tail* produces provably-in-bounds indices
 
@@ -147,7 +161,7 @@ We can eliminate *IsInBounds* check from the scalar loop with resliced *tail* va
         sum += input[i] // ⚠️ IsInBounds
     }
 
-We can assert the lower bound `i>=0` so the check disappears
+We can also assert the lower bound `i>=0` so the check disappears
 
     if i < 0 { i = 0 }
     for ; i < len(input); i++ {
@@ -156,9 +170,9 @@ We can assert the lower bound `i>=0` so the check disappears
 
 * Bounds checks elimination: vector loop
 
-: I've tried to apply a similar approach to the vector loop, but the checks stayed in place, so I resorted to the *unsafe* package to get rid of them.
-: The unsafe.Pointer type allows us to defeat the type system and read/write arbitrary memory.
-: unsafe.Add(inputData, i*8) calculates the memory address of the i-th array element (beginning of the next chunk of numbers), i.e., inputData + i*8 where 8 is the size of int64 in bytes.
+: I've tried to apply a similar approach to the vector loop, but the checks stayed in place, and I resorted to the unsafe pointers to bypass the type system and read the array chunks directly from memory.
+: Basically we express the same array access pattern in raw pointer arithmetic like in C. This way the compiler won't meddle with our code inserting the checks.
+: First, we learn the memory address of the beginning of the array. Then we calculate the memory address of the next chunk of numbers which is the array index i times the size of the array item in bytes.
 
 Similar approach didn't work on the vector loop, so I resorted to raw pointer arithmetic
 
@@ -180,6 +194,8 @@ Similar approach didn't work on the vector loop, so I resorted to raw pointer ar
     }
 
 * Benchmarks: intrinsics
+
+: Was it all worth it? Let's measure.
 
 SIMD *sum.Intrinsics()* is two times faster than SISD scalar *sum.Loop()*
 
@@ -204,25 +220,25 @@ SIMD *sum.Intrinsics()* is two times faster than SISD scalar *sum.Loop()*
 
 * Assembly
 
-: archsimd is the high-level way to work with SIMD, and assembly is the low-level way which avoids the bounds checks entirely.
-: Let's see how it works under the hood.
+: The archsimd package was the high-level way to work with SIMD technology. Let's look under the hood at assembly level.
 
-* SISD in assembly
+* SISD in Assembly
 
-: Let's see what a scalar version looks like in assembly code.
-: We can disassemble the binary with objdump tool and stare a bit at the loop because that's where the main logic lives.
+: We start simple: what does the plain scalar loop look like in assembly? Go object dump tool shows it to us.
+: It starts with a jump to a comparison of the input length and the array index i. If the index is less than the length, we jump to the ADDQ instruction.
+: Then we increment the i, and compare again to see if we need another iteration.
 
 Go generates the following amd64 assembly code for the scalar loop
 
-    $ GOOS=linux GOARCH=amd64 go build -o myprog main.go
+    $ GOOS=linux GOARCH=amd64 GOEXPERIMENT=simd go build -o myprog main.go
     $ go tool objdump -s sum.Loop myprog
 
     Memory address  Assembly instruction
        0x46fbe9      ↙ JMP  0x46fbf2
        0x46fbeb     ↓  ADDQ 0(AX)(CX*8), DX ↖     ; sum += input[i]
        0x46fbef     ↓  INCQ CX               ↑    ; i++
-       0x46fbf2      ↘ CMPQ BX, CX           ↑    ; i < len(input)
-       0x46fbf5        JG   0x46fbeb        ↗
+       0x46fbf2      ↘ CMPQ BX, CX           ↑    ; compare len (BX) and i (CX)
+       0x46fbf5        JG   0x46fbeb        ↗     ; loop back while len(input) > i
 
 Scalar loop
 
@@ -233,12 +249,13 @@ Scalar loop
 
 * ADDQ
 
-ADD Quadword adds 64-bit integers stored in _DX_ and a memory address
-`offset`+`reg1`+`reg2*scale`, and places the result in the _DX_
+: One instruction does the real work there, let's have a closer look at ADDQ. In our example it adds ...
+
+ADD Quadword adds 64-bit integers stored in a register and a memory address expressed as `offset`+`reg1`+`reg2*scale`
 
     ADDQ 0(AX)(CX*8), DX    ; DX = *(0 + AX + CX*8) + DX = input[i] + sum = 1 + 0
 
-- _DX_ is where the *sum* is kept
+- _DX_ register represents the *sum*
 - _AX_ holds a pointer to the underlying array (the memory address of the first element)
 - _CX_ represents an array index *i*
 - _8_ is the size of `int64` in bytes
@@ -247,7 +264,7 @@ If you're wondering how all those 16-bit registers could hold 64 bits, Go uses w
 
 * SIMD in assembly
 
-: We need a vector loop implemented in assembly. Here is my attempt at it.
+: Now the interesting part: the same sum, hand-written with vector instructions.
 
 Here is a manually written assembly code of the vector loop
 
@@ -272,17 +289,18 @@ Vector loop (pseudocode)
 
 * VPADDQ
 
+: The main character of that loop is VPADDQ instruction. It stands for...
+
 Vector extension Packed ADD Quadword adds 64-bit elements of vector registers _Y0_ and _Y1_, storing the result in the _Y0_
 
     VPADDQ  Y0, Y1, Y0    ; y0 += y1 = y0 + input[i:i+4] = [4, 3, 2, 1] + [8, 7, 6, 5]
 
 - _Y0_ and _Y1_ are 256-bit registers, that's why we can fit four `int64` elements there
-- We could fit eight integers if we used 512-bit ZMM registers
+- We could have fitted eight integers if we used 512-bit ZMM registers
 
 * VMOVDQU
 
-: But how can we move the array elements into the vector registers?
-: Behold the VMOVDQU instruction. It stands for ...
+: But before we can add them, we have to get the numbers into a vector register. Behold the VMOVDQU instruction. It stands for ...
 
 Vector extension MOVe Double Quadword Unaligned copies the four 64-bit integers from a possibly unaligned memory address stored in the _AX_ to the vector register _Y1_
 
@@ -311,8 +329,7 @@ we'll copy 256 bits (Y1 size) starting from address `0xc000054760`+`4`*`8`
 
 * Horizontal reduction
 
-: Eventually we need to somehow return a scalar result from the sum.Assembly() function.
-: To do that, we employ a technique called a horizontal reduction (summation).
+: After the vector loop we've got the semi-final result, but we still need to get a scalar result out of it. To do that, we employ horizontal reduction (summation).
 
 We summarize the Y0 = [12, 10, 8, 6] vector by adding its halves [12, 10] and [8, 6]
 
@@ -334,7 +351,7 @@ We summarize the Y0 = [12, 10, 8, 6] vector by adding its halves [12, 10] and [8
 
 * sum.Loop: arguments in the registers
 
-: How did the array pointer and the slice length end up in the registers?
+: We have built the whole loop. One question is left: how did the Go slice even get into those CPU registers when we called the function?
 
 Go ensures that all three parts of the slice header (array pointer, length, and capacity) are in the registers _AX_, _BX_, _CX_ respectively before calling the `sum.Loop` function
 
@@ -346,10 +363,7 @@ Go ensures that all three parts of the slice header (array pointer, length, and 
 
 * sum.Assembly: arguments on the stack
 
-: From looking at the sum.Assembly() code, we can see that the arguments are passed on the stack.
-: Note, prior to Go 1.17 a caller used to push all the arguments on the stack.
-
-Since `sum.Assembly` function's code is written by hand, the compiler defaulted to using the stack to pass the slice header
+Since our `sum.Assembly()` function is written by hand, the compiler defaults to using the stack to pass the slice header
 
     $ grep -A2 TEXT ./sum/sum.s
     TEXT ·Assembly(SB), NOSPLIT, $0-32
@@ -376,8 +390,11 @@ The arguments are written as offsets to the _FP_ pseudo-register:
 : TEXT argument "$0-32" tells that the stack frame size is zero, and the arguments size is 32 bytes (slice header and a return value).
 :
 : Arguments are stored in the caller's stack frame.
+: Note, prior to Go 1.17 a caller used to push all the arguments on the stack.
 
 * avo 🥑
+
+: Calculating all those offsets is tricky and error prone.
 
 The [[https://github.com/mmcloughlin/avo][avo]] package greatly simplifies writing Go assembly:
 
@@ -395,6 +412,8 @@ The [[https://github.com/mmcloughlin/avo][avo]] package greatly simplifies writi
     asm.Load(asm.Param("input").Len(), inputLen)                   // MOVQ input_len+8(FP), CX
 
 * Benchmarks: assembly
+
+: Not surpringly, the SIMD code in assembly is still twice as fast as the scalar loop.
 
 SIMD *sum.Assembly()* is two times faster than SISD scalar *sum.Loop()*
 
@@ -419,9 +438,8 @@ SIMD *sum.Assembly()* is two times faster than SISD scalar *sum.Loop()*
 
 * Takeaways
 
-- SIMD can speed up Go code (x2 faster sum of `[]int64` on Intel i5-10600)
+- SIMD can speed up Go code
 - used in: ML, cryptography, compression, image/audio processing, hashing, parsing
 - examples: [[https://simdjson.org][simdjson]] parses up to 25 GB/s of JSON (x25), [[https://lemire.me/blog/2026/05/23/parsing-ipv6-addresses-crazily-fast-with-avx-512/][parsing >70 M/s IPv6 addresses]] (x12), [[https://lemire.me/blog/2026/05/18/simd-accelerated-integer-to-string-conversion/][integer-to-string conversion]] (x2-x4)
 - prefer portable `simd` and `archsimd` packages over hand writing assembly, though beware of bounds checks in hot loops (check out [[https://marselester.com/go-archsimd-preview.html][Go archsimd preview]] post)
 - consider using [[https://github.com/mmcloughlin/avo][avo]] if you need to write Go assembly (check out [[https://marselester.com/hello-world-in-avo.html][Hello World in avo]] and [[https://marselester.com/intro-to-simd-in-avo.html][Intro to SIMD in avo]]) in my blog
-- note that vector registers look reversed when written out, for example, *[1,*2,*3,*4]* in memory but *[4,*3,*2,*1]* in a register because we display it from the highest lane to the lowest *[lane3,*lane2,*lane1,*lane0]*
