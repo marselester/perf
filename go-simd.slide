@@ -27,6 +27,19 @@ It would take 4 instructions to achieve the same result in a scalar mode
 
 Adding four pairs of integers per CPU cycle makes a program run faster 🏃🏽‍♂️‍➡️ compared to just one pair per cycle 🚶🏽‍♂️‍➡️
 
+* Why does it matter?
+
+SIMD is used in
+
+- machine learning: Llama.cpp, PyTorch
+- json: [[https://simdjson.org][simdjson]] at 25 GB/s (x25 faster than [[https://github.com/nlohmann/json][JSON for Modern C++]])
+- Unicode transcoding: [[https://simdutf.github.io/simdutf/][simdutf]] at 10 GB/s (x3-10 faster than ICU)
+- IPv6 addresses parsing: at 70 M/s (x12 faster than `inet_pton` from C std lib), see [[https://lemire.me/blog/2026/05/23/parsing-ipv6-addresses-crazily-fast-with-avx-512/][Daniel Lemire's blog]]
+- cryptography: [[https://pkg.go.dev/crypto/sha256][crypto/sha256]]
+- hashing: [[https://github.com/minio/highwayhash][minio/highwayhash]] at 10 GB/s per core
+- compression: [[https://github.com/klauspost/compress][klauspost/compress]]
+- image/audio/video processing: dav1d AV1 decoder
+
 * Go
 
 : That's the idea. Now, let's see how we can do it in Go by summing a slice of integers.
@@ -75,7 +88,7 @@ Go has experimental SIMD intrinsics via the [[https://pkg.go.dev/simd/archsimd@g
 
 `LoadInt64x4(input)` implies the CPU has a 256-bit vector register to load four 64-bit integers. If it doesn't, the program would crash, so we'd better check it at runtime.
 
-*X86* variable helps us to assertain what SIMD extensions are available
+*X86* variable helps us to ascertain what SIMD extensions are available
 
     if archsimd.X86.AVX() {
         xmm0 := archsimd.LoadInt64x2(input) // XMM 128-bit registers are supported...
@@ -89,7 +102,7 @@ Go has experimental SIMD intrinsics via the [[https://pkg.go.dev/simd/archsimd@g
         zmm0 := archsimd.LoadInt64x8(input) // ZMM 512-bit registers are supported...
     }
 
-There is however the [[https://pkg.go.dev/simd@go1.27rc2][simd]]: a portable, vector-size-agnostic package built on archsimd, which allows to skip these manual checks
+There is however the [[https://pkg.go.dev/simd@go1.27rc2][simd]]: a portable, vector-size-agnostic package built on archsimd, which allows us to skip these manual checks
 
 * Bounds checks
 
@@ -224,7 +237,7 @@ SIMD *sum.Intrinsics()* is two times faster than SISD scalar *sum.Loop()*
 
 * SISD in Assembly
 
-: We start simple: what does the plain scalar loop look like in assembly? Go object dump tool shows it to us.
+: We start simple: what does the plain scalar loop look like in Assembly? Go object dump tool shows it to us.
 : It starts with a jump to a comparison of the input length and the array index i. If the index is less than the length, we jump to the ADDQ instruction.
 : Then we increment the i, and compare again to see if we need another iteration.
 
@@ -262,7 +275,7 @@ ADD Quadword adds 64-bit integers stored in a register and a memory address expr
 
 If you're wondering how all those 16-bit registers could hold 64 bits, Go uses width-independent register names, so _AX_ names the full register _RAX_. The instruction suffix *Q* in *ADDQ* then means a 64-bit operation
 
-* SIMD in assembly
+* SIMD in Assembly
 
 : Now the interesting part: the same sum, hand-written with vector instructions.
 
@@ -271,8 +284,8 @@ Here is a manually written assembly code of the vector loop
     $ grep -A8 vector_loop: ./sum/sum.s
     vector_loop:
         ADDQ    $0x00000004, BX          ; i += 4
-        CMPQ    DX, BX                   ; i < loopEnd
-        JLE     vector_loop_end
+        CMPQ    DX, BX                   ; compare loopEnd (DX) with i (BX)
+        JLE     vector_loop_end          ; exit when loopEnd <= i
         VMOVDQU (AX)(BX*8), Y1           ; y1 := input[i:i+4]
         VPADDQ  Y0, Y1, Y0               ; y0 += y1
         JMP     vector_loop
@@ -411,9 +424,9 @@ The [[https://github.com/mmcloughlin/avo][avo]] package greatly simplifies writi
     asm.Load(asm.Param("input").Base(), input)                     // MOVQ input_base+0(FP), AX
     asm.Load(asm.Param("input").Len(), inputLen)                   // MOVQ input_len+8(FP), CX
 
-* Benchmarks: assembly
+* Benchmarks: Assembly
 
-: Not surpringly, the SIMD code in assembly is still twice as fast as the scalar loop.
+: Not surprisingly, the SIMD code in Assembly is still twice as fast as the scalar loop.
 
 SIMD *sum.Assembly()* is two times faster than SISD scalar *sum.Loop()*
 
@@ -438,8 +451,6 @@ SIMD *sum.Assembly()* is two times faster than SISD scalar *sum.Loop()*
 
 * Takeaways
 
-- SIMD can speed up Go code
-- used in: ML, cryptography, compression, image/audio processing, hashing, parsing
-- examples: [[https://simdjson.org][simdjson]] parses up to 25 GB/s of JSON (x25), [[https://lemire.me/blog/2026/05/23/parsing-ipv6-addresses-crazily-fast-with-avx-512/][parsing >70 M/s IPv6 addresses]] (x12), [[https://lemire.me/blog/2026/05/18/simd-accelerated-integer-to-string-conversion/][integer-to-string conversion]] (x2-x4)
-- prefer portable `simd` and `archsimd` packages over hand writing assembly, though beware of bounds checks in hot loops (check out [[https://marselester.com/go-archsimd-preview.html][Go archsimd preview]] post)
+- SIMD can greatly speed up Go code
+- prefer portable *simd* and *archsimd* packages over hand writing assembly, though beware of bounds checks in hot loops (check out [[https://marselester.com/go-archsimd-preview.html][Go archsimd preview]] post)
 - consider using [[https://github.com/mmcloughlin/avo][avo]] if you need to write Go assembly (check out [[https://marselester.com/hello-world-in-avo.html][Hello World in avo]] and [[https://marselester.com/intro-to-simd-in-avo.html][Intro to SIMD in avo]]) in my blog
